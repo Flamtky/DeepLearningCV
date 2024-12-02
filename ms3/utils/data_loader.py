@@ -46,6 +46,10 @@ def load_data(data_dir, split, batch_size=32, image_size=(224, 224)):
     # Shuffle the data
     df = df.sample(frac=1).reset_index(drop=True)
 
+    # Crop dataframe after X entries
+    #CROP = 640
+    #df = df.head(CROP)
+
     # Create TensorFlow dataset
     image_paths = df["image_path"].values
     age_labels = df["age_group"].values.astype(np.int32)

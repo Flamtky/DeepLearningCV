@@ -18,7 +18,7 @@ AGE_GROUPS = [
 # Constants
 IMAGE_SIZE = 224
 NUM_CHANNELS = 3
-NUM_AGE_CLASSES = len(AGE_GROUPS)  # Removed +1 for unknown
+NUM_AGE_CLASSES = len(AGE_GROUPS) 
 NUM_GENDER_CLASSES = 2  # Only Male/Female
 LATENT_DIM = 128
 
@@ -29,198 +29,163 @@ def build_discriminator():
     # Reduce initial filters and add dropout
     x = layers.Conv2D(32, (5, 5), strides=(2, 2), padding="same")(input_img)
     x = layers.LeakyReLU(0.2)(x)
-    x = layers.Dropout(0.3)(x)
     
     x = layers.Conv2D(64, (5, 5), strides=(2, 2), padding="same")(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
-    x = layers.Dropout(0.3)(x)
     
     x = layers.Conv2D(128, (5, 5), strides=(2, 2), padding="same")(x)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
-    x = layers.Dropout(0.3)(x)
-    
+
+    x = layers.Conv2D(256, (5, 5), strides=(2, 2), padding="same")(x)
+    x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
     
     x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.3)(x)
-    
+
     # Add dense layers before outputs
     x = layers.Dense(512)(x)
     x = layers.LeakyReLU(0.2)(x)
     
-    # Remove sigmoid activation for critic (Wasserstein)
     validity = layers.Dense(1, name="validity")(x)
-    age_output = layers.Dense(NUM_AGE_CLASSES, activation="softmax", name="age")(x)
-    gender_output = layers.Dense(NUM_GENDER_CLASSES, activation="softmax", name="gender")(x)
     
-    return keras.Model(input_img, [validity, age_output, gender_output])
+    return keras.Model(input_img, validity)
 
 def build_generator():
-    noise_shape = (LATENT_DIM + NUM_AGE_CLASSES + NUM_GENDER_CLASSES,)
-    noise = layers.Input(shape=noise_shape)
+    # Separate inputs for noise and conditions
+    noise = layers.Input(shape=(LATENT_DIM,))
+    age_input = layers.Input(shape=(NUM_AGE_CLASSES,))
+    gender_input = layers.Input(shape=(NUM_GENDER_CLASSES,))
+    
+    # Concatenate noise and conditions
+    x = layers.Concatenate()([noise, age_input, gender_input])
     
     # Increased initial dense size
-    x = layers.Dense(14 * 14 * 512)(noise)
+    x = layers.Dense(14 * 14 * 512)(x)
     x = layers.Reshape((14, 14, 512))(x)
     
-    x = layers.Conv2DTranspose(512, (5, 5), strides=(2, 2), padding="same")(x)
+    x = layers.Conv2DTranspose(512, (4, 4), strides=(2, 2), padding="same")(x)
     x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
+    x = layers.ReLU()(x)
     
-    x = layers.Conv2DTranspose(256, (5, 5), strides=(2, 2), padding="same")(x)
+    x = layers.Conv2DTranspose(256, (4, 4), strides=(2, 2), padding="same")(x)
     x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
+    x = layers.ReLU()(x)
     
-    x = layers.Conv2DTranspose(128, (5, 5), strides=(2, 2), padding="same")(x)
+    x = layers.Conv2DTranspose(128, (4, 4), strides=(2, 2), padding="same")(x)
     x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
+    x = layers.ReLU()(x)
     
-    x = layers.Conv2DTranspose(64, (5, 5), strides=(2, 2), padding="same")(x)
+    x = layers.Conv2DTranspose(64, (4, 4), strides=(2, 2), padding="same")(x)
     x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
+    x = layers.ReLU()(x)
     
     # Final conv with tanh
-    x = layers.Conv2D(NUM_CHANNELS, (5, 5), padding="same", activation="tanh")(x)
+    x = layers.Conv2D(NUM_CHANNELS, (4, 4), padding="same", activation="tanh")(x)
     
-    return keras.Model(noise, x)
+    return keras.Model([noise, age_input, gender_input], x)
 
-class ConditionalGAN(keras.Model):
-    def __init__(self):
+class WGAN(keras.Model):
+    def __init__(
+        self,
+        discriminator,
+        generator,
+        latent_dim,
+        discriminator_extra_steps=3,
+        gp_weight=10.0,
+    ):
         super().__init__()
-        self.discriminator = build_discriminator()
-        self.generator = build_generator()
+        self.discriminator = discriminator
+        self.generator = generator
+        self.latent_dim = latent_dim
+        self.d_steps = discriminator_extra_steps
+        self.gp_weight = gp_weight
 
-        # Summary
-        self.discriminator.summary()
-        self.generator.summary()
-
-        self.latent_dim = LATENT_DIM
-        self.seed_generator = keras.random.SeedGenerator(1337)
-        
-        # Loss trackers
-        self.gen_loss_tracker = keras.metrics.Mean(name="generator_loss")
-        self.disc_loss_tracker = keras.metrics.Mean(name="discriminator_loss")
-        self.age_loss_tracker = keras.metrics.Mean(name="age_loss")
-        self.gender_loss_tracker = keras.metrics.Mean(name="gender_loss")
-
-    @property
-    def metrics(self):
-        return [
-            self.gen_loss_tracker,
-            self.disc_loss_tracker,
-            self.age_loss_tracker,
-            self.gender_loss_tracker,
-        ]
-
-    def compile(self, d_optimizer, g_optimizer, discriminator_extra_steps=2):
+    def compile(self, d_optimizer, g_optimizer, d_loss_fn, g_loss_fn):
         super().compile()
         self.d_optimizer = d_optimizer
         self.g_optimizer = g_optimizer
-        self.discriminator_extra_steps = discriminator_extra_steps
-        
-        self.categorical_loss = keras.losses.CategoricalCrossentropy()
-        self.gp_weight = 10.0
-        
-        # Add gradient clipping
-        self.d_optimizer.clipnorm = 1.0
-        self.g_optimizer.clipnorm = 1.0
+        self.d_loss_fn = d_loss_fn
+        self.g_loss_fn = g_loss_fn
 
-    def gradient_penalty(self, real_images, fake_images):
-        batch_size = tf.shape(real_images)[0]
+    def gradient_penalty(self, batch_size, real_images, fake_images):
+        """Calculates the gradient penalty.
+
+        This loss is calculated on an interpolated image
+        and added to the discriminator loss.
+        """
+        # Get the interpolated image
         alpha = tf.random.uniform([batch_size, 1, 1, 1], 0.0, 1.0)
         diff = fake_images - real_images
         interpolated = real_images + alpha * diff
-        
+
         with tf.GradientTape() as gp_tape:
             gp_tape.watch(interpolated)
-            # Get only validity prediction
-            pred = self.discriminator(interpolated, training=True)[0]
-            
-        # Calculate gradients of prediction with respect to interpolated images
-        grads = gp_tape.gradient(pred, interpolated)
-        
-        # Calculate L2 norm of gradients
-        slopes = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3]))
-        gradient_penalty = tf.reduce_mean(tf.square(slopes - 1.0))
-        
-        return gradient_penalty
+            # 1. Get the discriminator output for this interpolated image.
+            pred = self.discriminator(interpolated, training=True)
+
+        # 2. Calculate the gradients w.r.t to this interpolated image.
+        grads = gp_tape.gradient(pred, [interpolated])[0]
+        # 3. Calculate the norm of the gradients.
+        norm = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3]))
+        gp = tf.reduce_mean((norm - 1.0) ** 2)
+        return gp
 
     def train_step(self, data):
         # Unpack the data
         real_images, labels = data
-        batch_size = tf.shape(real_images)[0]
-        
-        # Extract labels
         age_labels = labels["age"]
         gender_labels = labels["gender"]
-        
-        # Train discriminator
-        for _ in range(self.discriminator_extra_steps):
-            noise = tf.random.normal([batch_size, self.latent_dim])
-            combined_noise = tf.concat([noise, age_labels, gender_labels], axis=1)
-            
+        batch_size = tf.shape(real_images)[0]
+
+        for i in range(self.d_steps):
+            # Get the latent vector
+            random_latent_vectors = tf.random.normal(
+                shape=(batch_size, self.latent_dim)
+            )
+
             with tf.GradientTape() as tape:
-                generated_images = self.generator(combined_noise, training=True)
-                
-                # Real images
-                real_validity, real_age, real_gender = self.discriminator(real_images, training=True)
-                # Fake images
-                fake_validity, fake_age, fake_gender = self.discriminator(generated_images, training=True)
-                
-                # Wasserstein loss
-                d_loss_real = -tf.reduce_mean(real_validity)
-                d_loss_fake = tf.reduce_mean(fake_validity)
-                
-                # Auxiliary losses
-                d_loss_age = self.categorical_loss(age_labels, real_age)
-                d_loss_gender = self.categorical_loss(gender_labels, real_gender)
-                
-                # Gradient penalty
-                gp = self.gradient_penalty(real_images, generated_images)
-                
-                # Total discriminator loss
-                d_loss = (d_loss_real + d_loss_fake + 
-                         d_loss_age + d_loss_gender + 
-                         self.gp_weight * gp)
-                
-            # Train discriminator
-            grads = tape.gradient(d_loss, self.discriminator.trainable_weights)
-            self.d_optimizer.apply_gradients(zip(grads, self.discriminator.trainable_weights))
-        
-        # Train generator
-        noise = tf.random.normal([batch_size, self.latent_dim])
-        combined_noise = tf.concat([noise, age_labels, gender_labels], axis=1)
-        
+                # Generate fake images from the latent vector and conditions
+                fake_images = self.generator(
+                    [random_latent_vectors, age_labels, gender_labels], 
+                    training=True
+                )
+                # Get the logits for the fake images
+                fake_logits = self.discriminator(fake_images, training=True)
+                # Get the logits for the real images
+                real_logits = self.discriminator(real_images, training=True)
+
+                # Calculate the discriminator loss using the fake and real image logits
+                d_cost = self.d_loss_fn(real_img=real_logits, fake_img=fake_logits)
+                # Calculate the gradient penalty
+                gp = self.gradient_penalty(batch_size, real_images, fake_images)
+                # Add the gradient penalty to the original discriminator loss
+                d_loss = d_cost + gp * self.gp_weight
+
+            # Get the gradients w.r.t the discriminator loss
+            d_gradient = tape.gradient(d_loss, self.discriminator.trainable_variables)
+            # Update the weights of the discriminator using the discriminator optimizer
+            self.d_optimizer.apply_gradients(
+                zip(d_gradient, self.discriminator.trainable_variables)
+            )
+
+        random_latent_vectors = tf.random.normal(shape=(batch_size, self.latent_dim))
         with tf.GradientTape() as tape:
-            generated_images = self.generator(combined_noise, training=True)
-            fake_validity, fake_age, fake_gender = self.discriminator(generated_images, training=True)
-            
-            # Wasserstein loss for generator
-            g_loss_fake = -tf.reduce_mean(fake_validity)
-            g_loss_age = self.categorical_loss(age_labels, fake_age)
-            g_loss_gender = self.categorical_loss(gender_labels, fake_gender)
-            
-            # Total generator loss
-            g_loss = g_loss_fake + g_loss_age + g_loss_gender
-            
-        # Train generator
-        grads = tape.gradient(g_loss, self.generator.trainable_weights)
-        self.g_optimizer.apply_gradients(zip(grads, self.generator.trainable_weights))
-        
-        # Update metrics
-        self.gen_loss_tracker.update_state(g_loss)
-        self.disc_loss_tracker.update_state(d_loss)
-        self.age_loss_tracker.update_state(d_loss_age)
-        self.gender_loss_tracker.update_state(d_loss_gender)
-        
-        return {
-            "g_loss": self.gen_loss_tracker.result(),
-            "d_loss": self.disc_loss_tracker.result(),
-            "age_loss": self.age_loss_tracker.result(),
-            "gender_loss": self.gender_loss_tracker.result(),
-        }
-    
-    def call(self, inputs):
-        return self.generator(inputs)
+            # Generate fake images using conditions
+            generated_images = self.generator(
+                [random_latent_vectors, age_labels, gender_labels], 
+                training=True
+            )
+            # Get the discriminator logits for fake images
+            gen_img_logits = self.discriminator(generated_images, training=True)
+            # Calculate the generator loss
+            g_loss = self.g_loss_fn(gen_img_logits)
+
+        # Get the gradients w.r.t the generator loss
+        gen_gradient = tape.gradient(g_loss, self.generator.trainable_variables)
+        # Update the weights of the generator using the generator optimizer
+        self.g_optimizer.apply_gradients(
+            zip(gen_gradient, self.generator.trainable_variables)
+        )
+        return {"d_loss": d_loss, "g_loss": g_loss}

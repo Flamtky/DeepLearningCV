@@ -1,7 +1,7 @@
 import keras
 import os
 from glob import glob
-from model import ConditionalGAN, AGE_GROUPS, LATENT_DIM
+from model import WGAN, build_generator, build_discriminator, AGE_GROUPS, LATENT_DIM
 import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
@@ -36,14 +36,8 @@ class GenerateImagesCallback(keras.callbacks.Callback):
         self.test_gender = tf.constant(gender_conditions, dtype=tf.float32)
         
     def on_epoch_end(self, epoch, logs=None):
-        # Combine inputs
-        combined_noise = tf.concat(
-            [self.test_latent, self.test_age, self.test_gender],
-            axis=1
-        )
-        
         # Generate images
-        generated_images = self.model.generator(combined_noise)
+        generated_images = self.model.generator([self.test_latent, self.test_age, self.test_gender])
         
         # Plot results
         plt.figure(figsize=(12, 6))
@@ -64,19 +58,21 @@ class GenerateImagesCallback(keras.callbacks.Callback):
 
 class EvaluateCallback(keras.callbacks.Callback):
     """Custom callback to evaluate FID score on validation data"""
-    def __init__(self, validation_data, samples_per_eval=1000):
+    def __init__(self, validation_data):
         super().__init__()
         self.validation_data = validation_data
-        self.samples_per_eval = samples_per_eval
         self.results = {'epoch': [], 'fid': []}
         self.csv_path = 'logs/fid_scores.csv'
         
     def on_epoch_end(self, epoch, logs=None):
         real_images = []
         labels = []
-        for batch in self.validation_data.take(self.samples_per_eval // 32):
-            real_images.append(batch[0])
-            labels.append(batch[1])
+        # 3 batches
+        for _ in range(3):
+            x, y = next(iter(self.validation_data))
+            real_images.append(x)
+            labels.append(y)
+        print("Calculating FID score... for {len(real_images)} batches")
         real_images = tf.concat(real_images, axis=0)
         
         batch_size = tf.shape(real_images)[0]
@@ -114,6 +110,15 @@ def find_latest_checkpoint():
     latest_epoch = max(epochs)
     return f"checkpoints/cgan_{latest_epoch:02d}.weights.h5", latest_epoch
 
+# Add WGAN loss functions
+def discriminator_loss(real_img, fake_img):
+    real_loss = tf.reduce_mean(real_img)
+    fake_loss = tf.reduce_mean(fake_img)
+    return fake_loss - real_loss
+
+def generator_loss(fake_img):
+    return -tf.reduce_mean(fake_img)
+
 def train_cgan(epochs=100, batch_size=32, initial_epoch=0):
     os.makedirs('progress', exist_ok=True)
     os.makedirs('checkpoints', exist_ok=True)
@@ -123,12 +128,23 @@ def train_cgan(epochs=100, batch_size=32, initial_epoch=0):
     train_dataset = load_data('', 'train', batch_size=batch_size)
     val_dataset = load_data('', 'val', batch_size=batch_size)
 
-    # Initialize model
-    cgan = ConditionalGAN()
+    # Initialize WGAN components
+    discriminator = build_discriminator()
+    generator = build_generator()
+    
+    # Initialize WGAN
+    wgan = WGAN(
+        discriminator=discriminator,
+        generator=generator,
+        latent_dim=LATENT_DIM,
+        discriminator_extra_steps=5,  # Number of discriminator training steps
+        gp_weight=10.0,  # Gradient penalty weight
+    )
 
-    LEARNING_RATE = 0.0002
+    # WGAN typically uses a lower learning rate
+    LEARNING_RATE = 0.0001
     BETA_1 = 0.5
-    BETA_2 = 0.999
+    BETA_2 = 0.9
 
     generator_optimizer = keras.optimizers.Adam(
         learning_rate=LEARNING_RATE, 
@@ -141,10 +157,12 @@ def train_cgan(epochs=100, batch_size=32, initial_epoch=0):
         beta_2=BETA_2
     )
     
-    # Compile model
-    cgan.compile(
+    # Compile WGAN
+    wgan.compile(
         d_optimizer=discriminator_optimizer,
-        g_optimizer=generator_optimizer
+        g_optimizer=generator_optimizer,
+        d_loss_fn=discriminator_loss,
+        g_loss_fn=generator_loss,
     )
 
     latest_checkpoint, loaded_epoch = find_latest_checkpoint()
@@ -153,7 +171,7 @@ def train_cgan(epochs=100, batch_size=32, initial_epoch=0):
     if latest_checkpoint is not None and initial_epoch == 0:
         try:
             print(f"Attempting to load checkpoint: {latest_checkpoint}")
-            cgan.load_weights(latest_checkpoint)
+            wgan.load_weights(latest_checkpoint)
             initial_epoch = loaded_epoch
             print(f"Successfully resumed from epoch {initial_epoch}")
         except Exception as e:
@@ -163,22 +181,19 @@ def train_cgan(epochs=100, batch_size=32, initial_epoch=0):
     else:
         print("No checkpoint found or initial epoch specified. Starting from scratch...")
 
-    # Train
-    history = cgan.fit(
+    # Update callbacks to use wgan instead of cgan
+    history = wgan.fit(
         train_dataset,
         epochs=epochs,
         initial_epoch=initial_epoch,
-        #validation_data=val_dataset,
-        #validation_steps=STEPS_PER_EPOCH // 5,
         callbacks=[
             keras.callbacks.ModelCheckpoint(
-                filepath="checkpoints/cgan_{epoch:02d}.weights.h5",
+                filepath="checkpoints/wgan_{epoch:02d}.weights.h5",
                 save_weights_only=True,
                 save_freq='epoch'
             ),
-            # Save best model separately
             keras.callbacks.ModelCheckpoint(
-                filepath="checkpoints/cgan_best.weights.h5",
+                filepath="checkpoints/wgan_best.weights.h5",
                 save_weights_only=True,
                 save_best_only=True,
                 monitor='g_loss',
