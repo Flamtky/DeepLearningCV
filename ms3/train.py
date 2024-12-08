@@ -1,228 +1,156 @@
-import keras
 import os
-from glob import glob
-from model import WGAN, build_generator, build_discriminator, AGE_GROUPS, LATENT_DIM
-import tensorflow as tf
-import numpy as np
-import matplotlib.pyplot as plt
-from utils.data_loader import load_data
-import pandas as pd
-from evaluate import calculate_fid
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TensorFlow warnings
 os.environ["KERAS_BACKEND"] = "tensorflow"
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = (
     "false"  # True to prevent tensorflow from allocating all GPU memory
 )
-os.environ["CUDA_VISIBLE_DEVICES"] = "0" # Using GPU 1
+os.environ["CUDA_VISIBLE_DEVICES"] = "1" # GPU to use
 
-class GenerateImagesCallback(keras.callbacks.Callback):
-    def __init__(self, latent_dim=LATENT_DIM):
-        super().__init__()
-        self.latent_dim = latent_dim
-        # Fixed latent vectors and conditions for consistent visualization
-        self.test_latent = tf.random.normal([len(AGE_GROUPS) * 2, latent_dim])
-        
-        # Create fixed conditions - 2 of each age group with alternating genders
-        age_conditions = np.zeros((len(AGE_GROUPS) * 2, len(AGE_GROUPS)))
-        gender_conditions = np.zeros((len(AGE_GROUPS) * 2, 2))
-        
-        for i in range(len(AGE_GROUPS)):  # age groups, 2 examples each
-            age_conditions[i*2:(i+1)*2, i] = 1  # Set age group
-            gender_conditions[i*2, 0] = 1       # Male
-            gender_conditions[i*2+1, 1] = 1     # Female
-            
-        self.test_age = tf.constant(age_conditions, dtype=tf.float32)
-        self.test_gender = tf.constant(gender_conditions, dtype=tf.float32)
-        
-    def on_epoch_end(self, epoch, logs=None):
-        # Generate images
-        generated_images = self.model.generator([self.test_latent, self.test_age, self.test_gender])
-        
-        # Plot results
-        plt.figure(figsize=(12, 6))
-        for i in range(len(AGE_GROUPS) * 2):
-            plt.subplot(2, len(AGE_GROUPS), i+1)
-            # Adjust image range from [-1,1] to [0,1]
-            plt.imshow((generated_images[i] + 1) * 0.5)
-            plt.axis('off')
-            age_group = AGE_GROUPS[tf.argmax(self.test_age[i])]
-            gender = "M" if self.test_gender[i][0] > 0 else "F"
-            plt.title(f'{age_group}\n{gender}', fontsize=8)
-        
-        plt.suptitle(f'Epoch {epoch+1}')
-        plt.tight_layout()
-        # Save the figure
-        plt.savefig(f'progress/epoch_{epoch+1:03d}.png')
-        plt.close()
+import keras
+from utils.data_loader import load_data_new
+from model import (
+    create_model,
+    conditional_age_loss,
+    conditional_gender_loss,
+    face_loss,
+    age_acc,
+    gen_acc,
+)
+import parameters as pa
 
-class EvaluateCallback(keras.callbacks.Callback):
-    """Custom callback to evaluate FID score on validation data"""
-    def __init__(self, validation_data):
-        super().__init__()
-        self.validation_data = validation_data
-        self.results = {'epoch': [], 'fid': []}
-        self.csv_path = 'logs/fid_scores.csv'
-        
-    def on_epoch_end(self, epoch, logs=None):
-        real_images = []
-        labels = []
-        # 3 batches
-        for _ in range(3):
-            x, y = next(iter(self.validation_data))
-            real_images.append(x)
-            labels.append(y)
-        print("Calculating FID score... for {len(real_images)} batches")
-        real_images = tf.concat(real_images, axis=0)
-        
-        batch_size = tf.shape(real_images)[0]
-        noise = tf.random.normal([batch_size, self.model.latent_dim])
-        
-        age_labels = tf.concat([l['age'] for l in labels], axis=0)
-        gender_labels = tf.concat([l['gender'] for l in labels], axis=0)
-        combined_noise = tf.concat([noise, age_labels, gender_labels], axis=1)
-        
-        generated_images = self.model.generator(combined_noise)
-        
-        fid_score = calculate_fid(real_images, generated_images)
-        
-        self.results['epoch'].append(epoch + 1)
-        self.results['fid'].append(fid_score)
-        
-        pd.DataFrame(self.results).to_csv(self.csv_path, index=False)
-        
-        logs = logs or {}
-        logs['fid'] = fid_score
 
-def find_latest_checkpoint():
-    """Find the latest checkpoint in the checkpoints directory"""
-    checkpoints = glob("checkpoints/cgan_*.weights.h5")
-    if not checkpoints:
-        return None, 0 # No checkpoints found
-    
-    epochs = []
-    for ckpt in checkpoints:
-        try:
-            epoch = int(ckpt.split('_')[-1].split('.')[0])
-            epochs.append(epoch)
-        except ValueError:
-            continue # Ignore checkpoints with non-integer epoch values (e.g., "best")
-    latest_epoch = max(epochs)
-    return f"checkpoints/cgan_{latest_epoch:02d}.weights.h5", latest_epoch
+DATA_DIR = "."
 
-# Add WGAN loss functions
-def discriminator_loss(real_img, fake_img):
-    real_loss = tf.reduce_mean(real_img)
-    fake_loss = tf.reduce_mean(fake_img)
-    return fake_loss - real_loss
 
-def generator_loss(fake_img):
-    return -tf.reduce_mean(fake_img)
+def main(testname="", **kwargs):
+    train_dataset = load_data_new(DATA_DIR, "train", batch_size=pa.BATCH_SIZE)
+    val_dataset = load_data_new(DATA_DIR, "val", batch_size=pa.BATCH_SIZE)
 
-def train_cgan(epochs=100, batch_size=32, initial_epoch=0):
-    os.makedirs('progress', exist_ok=True)
-    os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs('logs', exist_ok=True) 
-    
-    # Load data
-    train_dataset = load_data('', 'train', batch_size=batch_size)
-    val_dataset = load_data('', 'val', batch_size=batch_size)
+    model_parameters = {
+        "BASE_MODEL_NAME": "efficientnetb0",
+        "DENSE_LAYER_SIZE": 512,
+        "NUMBER_OF_DENSE_LAYERS": 2,
+        "DENSE_ACTIVATION_FUNCTION": "relu",
+        "USE_BATCH_NORM": False,
+        "DROPOUT_RATE": 0.0,
+        "WEIGHT_DECAY": 0.0,
+        "LR_INIT": 1e-5,
+        "LR_DECAY": 0.9,
+        "BASE_MODELS": pa.BASE_MODELS,
+        "OPTIMIZER": "adam",
+        "ADAMW_DECAY": 1e-5,
+        "USE_VERSION": 2, # 0 old version for dense layer testing; 1 is own custom composition; 2 is final model
+    }
 
-    # Initialize WGAN components
-    discriminator = build_discriminator()
-    generator = build_generator()
-    
-    # Initialize WGAN
-    wgan = WGAN(
-        discriminator=discriminator,
-        generator=generator,
-        latent_dim=LATENT_DIM,
-        discriminator_extra_steps=5,  # Number of discriminator training steps
-        gp_weight=10.0,  # Gradient penalty weight
-    )
+    # Update parameters with any provided kwargs
+    model_parameters.update((k, v) for k, v in kwargs.items() if v is not None)
 
-    # WGAN typically uses a lower learning rate
-    LEARNING_RATE = 0.0001
-    BETA_1 = 0.5
-    BETA_2 = 0.9
 
-    generator_optimizer = keras.optimizers.Adam(
-        learning_rate=LEARNING_RATE, 
-        beta_1=BETA_1, 
-        beta_2=BETA_2
-    )
-    discriminator_optimizer = keras.optimizers.Adam(
-        learning_rate=LEARNING_RATE,
-        beta_1=BETA_1,
-        beta_2=BETA_2
-    )
-    
-    # Compile WGAN
-    wgan.compile(
-        d_optimizer=discriminator_optimizer,
-        g_optimizer=generator_optimizer,
-        d_loss_fn=discriminator_loss,
-        g_loss_fn=generator_loss,
-    )
+    # Debug Prints
+    print(pa.generateModelName("", ".", **model_parameters))
 
-    latest_checkpoint, loaded_epoch = find_latest_checkpoint()
-    
-    # Only load checkpoint if it exists and we're not specifying an initial epoch
-    if latest_checkpoint is not None and initial_epoch == 0:
-        try:
-            print(f"Attempting to load checkpoint: {latest_checkpoint}")
-            wgan.load_weights(latest_checkpoint)
-            initial_epoch = loaded_epoch
-            print(f"Successfully resumed from epoch {initial_epoch}")
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-            print("Starting training from scratch...")
-            initial_epoch = 0
+    model = create_model(model_parameters, face_only=pa.FACE_ONLY)
+    model.summary()
+
+    # Optionally load weights from a checkpoint
+    checkpoint_path = None
+    if checkpoint_path is not None:
+        model.load_weights(checkpoint_path)
+
+    if pa.FACE_ONLY:
+        metrics = {
+            "face": ["accuracy"],
+        }
+        losses = {
+            "face": face_loss,
+        }
+        pa.LOSS_WEIGHTS = {
+            "face": 1.0,
+        }
     else:
-        print("No checkpoint found or initial epoch specified. Starting from scratch...")
+        metrics = {
+            "face": ["accuracy"],
+            "age": [age_acc],
+            "gender": [gen_acc],
+        }
+        losses = {
+            "face": face_loss,
+            "age": conditional_age_loss,
+            "gender": conditional_gender_loss,
+        }
 
-    # Update callbacks to use wgan instead of cgan
-    history = wgan.fit(
-        train_dataset,
-        epochs=epochs,
-        initial_epoch=initial_epoch,
-        callbacks=[
-            keras.callbacks.ModelCheckpoint(
-                filepath="checkpoints/wgan_{epoch:02d}.weights.h5",
-                save_weights_only=True,
-                save_freq='epoch'
-            ),
-            keras.callbacks.ModelCheckpoint(
-                filepath="checkpoints/wgan_best.weights.h5",
-                save_weights_only=True,
-                save_best_only=True,
-                monitor='g_loss',
-                mode='min'
-            ),
-            keras.callbacks.TensorBoard(
-                log_dir='logs',
-                update_freq='epoch'
-            ),
-            GenerateImagesCallback(),
-            #EvaluateCallback(val_dataset)
-        ]
+    if model_parameters["OPTIMIZER"] == "adamw":
+        optimizer = pa.OPTIMIZERS[model_parameters["OPTIMIZER"]](
+            learning_rate=model_parameters["LR_INIT"],
+            weight_decay=model_parameters["ADAMW_DECAY"],
+        )
+    else:
+        optimizer = pa.OPTIMIZERS[model_parameters["OPTIMIZER"]](
+            model_parameters["LR_INIT"]
+        )
+    model.compile(
+        optimizer=optimizer,
+        loss_weights=pa.LOSS_WEIGHTS,
+        metrics=metrics,
+        loss=losses,
+        run_eagerly=False,
     )
-    return history
+
+    checkpoint_callback = keras.callbacks.ModelCheckpoint(
+        filepath="checkpoints/"
+        + pa.generateModelName(".keras", "./checkpoints", **model_parameters),
+        save_weights_only=False,
+        save_freq="epoch",
+        verbose=1,
+        save_best_only=True,
+    )
+
+    lr_scheduler = keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=model_parameters["LR_DECAY"],
+        patience=1,
+        verbose=1,
+        mode="auto",
+    )
+
+    early_stopping = keras.callbacks.EarlyStopping(
+        monitor="val_loss", patience=3, verbose=1, restore_best_weights=True
+    )
+
+    tensorBoard_callback = keras.callbacks.TensorBoard(
+        f"logs/{testname}/"
+        + pa.generateModelName("", f"logs/{testname}", **model_parameters)
+    )
+
+    # Train the model
+    model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        epochs=pa.EPOCHS,
+        callbacks=[
+            checkpoint_callback,
+            tensorBoard_callback,
+            lr_scheduler,
+            # early_stopping
+        ],
+    )
+
+    # Save the final model
+    model.save(
+        "models/" + pa.generateModelName(".keras", "./models", **model_parameters)
+    )
+
+def final_model():
+    # Final Model
+    # v2:
+    # face: dense 128, leaky relu, ohne Dropout, Adam
+    # age: 3x dense 512, leaky relu, dropout 0.2, Adam
+    # gender: dense 512, leaky relu, dropout 0.2, Adam
+    main(
+        "ms3_final",
+        USE_VERSION=2,
+    )
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--resume-epoch', type=int, default=0)
-    args = parser.parse_args()
-    
-    try:
-        train_cgan(
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            initial_epoch=args.resume_epoch
-        )
-    except KeyboardInterrupt:
-        print("\nTraining interrupted. Progress has been saved.")
-        print("To resume, run with: --resume-epoch LAST_EPOCH")
+    final_model()

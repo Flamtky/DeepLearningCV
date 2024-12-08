@@ -1,191 +1,227 @@
-import keras
+import keras, sys
 from keras import layers
-from keras import ops
 import tensorflow as tf
-import numpy as np
 
-# Match constants with data_loader.py
 AGE_GROUPS = [
-    "INFANT",     # 0-4
-    "CHILD",      # 5-12
-    "TEENAGER",   # 13-19
-    "YOUNG_ADULT",# 20-29
-    "ADULT",      # 30-49
-    "MIDDLE_AGED",# 50-59
-    "SENIOR",     # 60+
+    "INFANT", # 0-4
+    "CHILD", # 5-12
+    "TEENAGER", # 13-19
+    "YOUNG_ADULT", # 20-29
+    "ADULT", # 30-49
+    "MIDDLE_AGED", # 50-59
+    "SENIOR", # 60+
 ]
 
-# Constants
-IMAGE_SIZE = 224
-NUM_CHANNELS = 3
-NUM_AGE_CLASSES = len(AGE_GROUPS) 
-NUM_GENDER_CLASSES = 2  # Only Male/Female
-LATENT_DIM = 128
 
-# Create the discriminator with multiple outputs
-def build_discriminator():
-    input_img = layers.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, NUM_CHANNELS))
-    
-    # Reduce initial filters and add dropout
-    x = layers.Conv2D(32, (5, 5), strides=(2, 2), padding="same")(input_img)
-    x = layers.LeakyReLU(0.2)(x)
-    
-    x = layers.Conv2D(64, (5, 5), strides=(2, 2), padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
-    
-    x = layers.Conv2D(128, (5, 5), strides=(2, 2), padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
+def create_model(params, face_only=False):
+    use_version: int = params.get("USE_VERSION", 0)
 
-    x = layers.Conv2D(256, (5, 5), strides=(2, 2), padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(0.2)(x)
-    
-    x = layers.GlobalAveragePooling2D()(x)
+    base_model_class = params["BASE_MODELS"][params["BASE_MODEL_NAME"]]
+    base_model = base_model_class(
+        weights="imagenet", include_top=False, input_shape=(224, 224, 3)
+    )
 
-    # Add dense layers before outputs
-    x = layers.Dense(512)(x)
-    x = layers.LeakyReLU(0.2)(x)
-    
-    validity = layers.Dense(1, name="validity")(x)
-    
-    return keras.Model(input_img, validity)
+    base_model.trainable = False
+    # Unfreezing the last 5 layers of the base model
+    for layer in base_model.layers[:-5]:
+        layer.trainable = True
 
-def build_generator():
-    # Separate inputs for noise and conditions
-    noise = layers.Input(shape=(LATENT_DIM,))
-    age_input = layers.Input(shape=(NUM_AGE_CLASSES,))
-    gender_input = layers.Input(shape=(NUM_GENDER_CLASSES,))
-    
-    # Concatenate noise and conditions
-    x = layers.Concatenate()([noise, age_input, gender_input])
-    
-    # Increased initial dense size
-    x = layers.Dense(14 * 14 * 512)(x)
-    x = layers.Reshape((14, 14, 512))(x)
-    
-    x = layers.Conv2DTranspose(512, (4, 4), strides=(2, 2), padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    
-    x = layers.Conv2DTranspose(256, (4, 4), strides=(2, 2), padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    
-    x = layers.Conv2DTranspose(128, (4, 4), strides=(2, 2), padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    
-    x = layers.Conv2DTranspose(64, (4, 4), strides=(2, 2), padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-    
-    # Final conv with tanh
-    x = layers.Conv2D(NUM_CHANNELS, (4, 4), padding="same", activation="tanh")(x)
-    
-    return keras.Model([noise, age_input, gender_input], x)
+    inputs = keras.Input(shape=(224, 224, 3))
+    base = base_model(inputs, training=False)
+    base = layers.GlobalAveragePooling2D()(base)
 
-class WGAN(keras.Model):
-    def __init__(
-        self,
-        discriminator,
-        generator,
-        latent_dim,
-        discriminator_extra_steps=3,
-        gp_weight=10.0,
-    ):
-        super().__init__()
-        self.discriminator = discriminator
-        self.generator = generator
-        self.latent_dim = latent_dim
-        self.d_steps = discriminator_extra_steps
-        self.gp_weight = gp_weight
+    outputs = {}
+    if face_only:
+        outputs = createSingelTaskModel(params, base, outputs)
+    else:
+        if use_version == 0:
+            outputs = createMultiTaskModel_old(params, base, outputs)
+        elif use_version == 1:
+            outputs = createMultiTaskModel(params, base, outputs)
+        elif use_version == 2:
+            outputs = createMultiTaskModel_v2(params, base, outputs)
 
-    def compile(self, d_optimizer, g_optimizer, d_loss_fn, g_loss_fn):
-        super().compile()
-        self.d_optimizer = d_optimizer
-        self.g_optimizer = g_optimizer
-        self.d_loss_fn = d_loss_fn
-        self.g_loss_fn = g_loss_fn
+    model = keras.Model(inputs=inputs, outputs=outputs)
+    return model
 
-    def gradient_penalty(self, batch_size, real_images, fake_images):
-        """Calculates the gradient penalty.
+def createSingelTaskModel(params, base_model, outputs):
+    singelTask_model = base_model
+    for _ in range(params["NUMBER_OF_DENSE_LAYERS"]):
+        singelTask_model = layers.Dense(
+            params["DENSE_LAYER_SIZE"],
+            activation=params["DENSE_ACTIVATION_FUNCTION"],
+            kernel_regularizer=keras.regularizers.l2(params["WEIGHT_DECAY"]),
+        )(singelTask_model)
+        if params["USE_BATCH_NORM"]:
+            singelTask_model = layers.BatchNormalization()(singelTask_model)
+        if params["DROPOUT_RATE"] > 0:
+            singelTask_model = layers.Dropout(params["DROPOUT_RATE"])(singelTask_model)
+    singelTask_model = layers.Dense(1, activation="sigmoid", name="face")(singelTask_model)
+    outputs["face"] = singelTask_model
 
-        This loss is calculated on an interpolated image
-        and added to the discriminator loss.
-        """
-        # Get the interpolated image
-        alpha = tf.random.uniform([batch_size, 1, 1, 1], 0.0, 1.0)
-        diff = fake_images - real_images
-        interpolated = real_images + alpha * diff
+    return outputs
 
-        with tf.GradientTape() as gp_tape:
-            gp_tape.watch(interpolated)
-            # 1. Get the discriminator output for this interpolated image.
-            pred = self.discriminator(interpolated, training=True)
+def createMultiTaskModel_old(params, base_model, outputs):
+    for output_name in ["face", "age", "gender"]:
+        multiTask_model = base_model
+        for _ in range(params["NUMBER_OF_DENSE_LAYERS"]):
+            multiTask_model = layers.Dense(
+                    params["DENSE_LAYER_SIZE"],
+                    activation=params["DENSE_ACTIVATION_FUNCTION"],
+                    kernel_regularizer=keras.regularizers.l2(params["WEIGHT_DECAY"]),
+                )(multiTask_model)
+            if params["USE_BATCH_NORM"]:
+                multiTask_model = layers.BatchNormalization()(multiTask_model)
+            if params["DROPOUT_RATE"] > 0:
+                multiTask_model = layers.Dropout(params["DROPOUT_RATE"])(multiTask_model)
+        if output_name == "face":
+            multiTask_model = layers.Dense(1, activation="sigmoid", name="face")(multiTask_model)
+        elif output_name == "age":
+            multiTask_model = layers.Dense(len(AGE_GROUPS), activation="softmax", name="age")(multiTask_model)
+        elif output_name == "gender":
+            multiTask_model = layers.Dense(2, activation="softmax", name="gender")(multiTask_model)
+        outputs[output_name] = multiTask_model
 
-        # 2. Calculate the gradients w.r.t to this interpolated image.
-        grads = gp_tape.gradient(pred, [interpolated])[0]
-        # 3. Calculate the norm of the gradients.
-        norm = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3]))
-        gp = tf.reduce_mean((norm - 1.0) ** 2)
-        return gp
+    return outputs
 
-    def train_step(self, data):
-        # Unpack the data
-        real_images, labels = data
-        age_labels = labels["age"]
-        gender_labels = labels["gender"]
-        batch_size = tf.shape(real_images)[0]
+def createMultiTaskModel(params, base_model, outputs):
+    # Dense
+    # BatchNormalization
+    # Activation
+    # Dropout
+    mutliTask_model = base_model
 
-        for i in range(self.d_steps):
-            # Get the latent vector
-            random_latent_vectors = tf.random.normal(
-                shape=(batch_size, self.latent_dim)
-            )
+    regularizer = None
+    if params["WEIGHT_DECAY"] > 0:
+        regularizer = keras.regularizers.l2(params["WEIGHT_DECAY"])
 
-            with tf.GradientTape() as tape:
-                # Generate fake images from the latent vector and conditions
-                fake_images = self.generator(
-                    [random_latent_vectors, age_labels, gender_labels], 
-                    training=True
-                )
-                # Get the logits for the fake images
-                fake_logits = self.discriminator(fake_images, training=True)
-                # Get the logits for the real images
-                real_logits = self.discriminator(real_images, training=True)
+    face = layers.Dense(128, activation=None, kernel_regularizer=regularizer)(mutliTask_model)
+    face = _generateBNandDropoutLayer(face, params["DENSE_ACTIVATION_FUNCTION"], params["DROPOUT_RATE"], params["USE_BATCH_NORM"])
+    face = layers.Dense(1, activation="sigmoid", name="face")(face)
 
-                # Calculate the discriminator loss using the fake and real image logits
-                d_cost = self.d_loss_fn(real_img=real_logits, fake_img=fake_logits)
-                # Calculate the gradient penalty
-                gp = self.gradient_penalty(batch_size, real_images, fake_images)
-                # Add the gradient penalty to the original discriminator loss
-                d_loss = d_cost + gp * self.gp_weight
+    age = layers.Dense(512, activation=None, kernel_regularizer=regularizer)(mutliTask_model)
+    age = _generateBNandDropoutLayer(age, params["DENSE_ACTIVATION_FUNCTION"], params["DROPOUT_RATE"], params["USE_BATCH_NORM"])
+    age = layers.Dense(512, activation=None, kernel_regularizer=regularizer)(age)
+    age = _generateBNandDropoutLayer(age, params["DENSE_ACTIVATION_FUNCTION"], params["DROPOUT_RATE"], params["USE_BATCH_NORM"])
+    age = layers.Dense(512, activation=None, kernel_regularizer=regularizer)(age)
+    age = _generateBNandDropoutLayer(age, params["DENSE_ACTIVATION_FUNCTION"], params["DROPOUT_RATE"], params["USE_BATCH_NORM"])
+    age = layers.Dense(len(AGE_GROUPS), activation="softmax", name="age")(age)
 
-            # Get the gradients w.r.t the discriminator loss
-            d_gradient = tape.gradient(d_loss, self.discriminator.trainable_variables)
-            # Update the weights of the discriminator using the discriminator optimizer
-            self.d_optimizer.apply_gradients(
-                zip(d_gradient, self.discriminator.trainable_variables)
-            )
+    gender = layers.Dense(512, activation=None, kernel_regularizer=regularizer)(mutliTask_model)
+    gender = _generateBNandDropoutLayer(gender, params["DENSE_ACTIVATION_FUNCTION"], params["DROPOUT_RATE"], params["USE_BATCH_NORM"])
+    gender = layers.Dense(2, activation="softmax", name="gender")(gender)
 
-        random_latent_vectors = tf.random.normal(shape=(batch_size, self.latent_dim))
-        with tf.GradientTape() as tape:
-            # Generate fake images using conditions
-            generated_images = self.generator(
-                [random_latent_vectors, age_labels, gender_labels], 
-                training=True
-            )
-            # Get the discriminator logits for fake images
-            gen_img_logits = self.discriminator(generated_images, training=True)
-            # Calculate the generator loss
-            g_loss = self.g_loss_fn(gen_img_logits)
+    outputs["face"] = face
+    outputs["age"] = age
+    outputs["gender"] = gender
 
-        # Get the gradients w.r.t the generator loss
-        gen_gradient = tape.gradient(g_loss, self.generator.trainable_variables)
-        # Update the weights of the generator using the generator optimizer
-        self.g_optimizer.apply_gradients(
-            zip(gen_gradient, self.generator.trainable_variables)
-        )
-        return {"d_loss": d_loss, "g_loss": g_loss}
+    return outputs
+
+def createMultiTaskModel_v2(_params, base_model, outputs):
+    # Dense
+    # BatchNormalization
+    # Activation
+    # Dropout
+    mutliTask_model = base_model
+
+    face = layers.Dense(128, activation=None)(mutliTask_model)
+    face = _generateBNandDropoutLayer(face, "leaky_relu", 0.0, False)
+    face = layers.Dense(1, activation="sigmoid", name="face")(face)
+
+    age = layers.Dense(512, activation=None)(mutliTask_model)
+    age = _generateBNandDropoutLayer(age, "leaky_relu", 0.2, False)
+    age = layers.Dense(2, activation="softmax", name="age")(age) # only isYoung
+
+    gender = layers.Dense(512, activation=None)(mutliTask_model)
+    gender = _generateBNandDropoutLayer(gender, "leaky_relu", 0.2, False)
+    gender = layers.Dense(2, activation="softmax", name="gender")(gender)
+
+    outputs["face"] = face
+    outputs["age"] = age
+    outputs["gender"] = gender
+
+    return outputs
+
+def _generateBNandDropoutLayer(model, activation, dropout_rate, use_batch_norm):
+    if use_batch_norm:
+        model = layers.BatchNormalization()(model)
+    model = layers.Activation(activation)(model)
+    if dropout_rate > 0:
+        model = layers.Dropout(dropout_rate)(model)
+    return model
+
+@keras.saving.register_keras_serializable()
+def conditional_age_loss(y_true, y_pred):
+    loss = keras.losses.binary_crossentropy(y_true[:, 0:2], y_pred)
+    face_present = tf.cast(y_true[:, -1], tf.float32)
+
+    loss = tf.where(face_present <= 0.9, loss, 0.0)
+    if tf.executing_eagerly():
+        tf.print("---------conditional_age_loss-----------")
+        tf.print("face_present: ", face_present.numpy())
+        tf.print("y_true: ", y_true.numpy())
+        tf.print("y_pred: ", y_pred.numpy())
+        tf.print("loss: ", loss.numpy())
+        tf.print("--------------------")
+    return tf.reduce_mean(loss)
+
+
+@keras.saving.register_keras_serializable()
+def conditional_gender_loss(y_true, y_pred):
+    loss = keras.losses.binary_crossentropy(y_true[:, 0:2], y_pred)
+    face_present = tf.cast(y_true[:, -1], tf.float32)
+
+    loss = tf.where(face_present <= 0.9, loss, 0.0)
+    if tf.executing_eagerly():
+        tf.print("---------conditional_gender_loss-----------")
+        tf.print("face_present: ", face_present.numpy())
+        tf.print("y_true: ", y_true.numpy())
+        tf.print("y_pred: ", y_pred.numpy())
+        tf.print("loss: ", loss.numpy())
+        tf.print("--------------------")
+    return tf.reduce_mean(loss)
+
+
+@keras.saving.register_keras_serializable()
+def face_loss(y_true, y_pred):
+    return keras.losses.binary_crossentropy(y_true, y_pred)
+
+
+@keras.saving.register_keras_serializable()
+def age_acc(y_true, y_pred):
+    face_present = tf.cast(y_true[:, -1] <= 0.9, tf.float32)
+    true_labels = tf.argmax(y_true, axis=-1)
+    pred_labels = tf.argmax(y_pred, axis=-1)
+    correct = tf.cast(tf.equal(true_labels, pred_labels), tf.float32) * face_present
+    accuracy = tf.reduce_sum(correct) / (
+        tf.reduce_sum(face_present) + tf.keras.backend.epsilon()
+    )
+    if tf.executing_eagerly():
+        tf.print("---------age_acc-----------")
+        tf.print("face_present: ", face_present.numpy())
+        tf.print("true_labels: ", true_labels.numpy())
+        tf.print("pred_labels: ", pred_labels.numpy())
+        tf.print("correct: ", correct.numpy())
+        tf.print("accuracy: ", accuracy.numpy())
+        tf.print("--------------------")
+    return accuracy
+
+
+@keras.saving.register_keras_serializable()
+def gen_acc(y_true, y_pred):
+    face_present = tf.cast(y_true[:, -1] <= 0.9, tf.float32)
+    true_labels = tf.argmax(y_true, axis=-1)
+    pred_labels = tf.argmax(y_pred, axis=-1)
+    correct = tf.cast(tf.equal(true_labels, pred_labels), tf.float32) * face_present
+    accuracy = tf.reduce_sum(correct) / (
+        tf.reduce_sum(face_present) + tf.keras.backend.epsilon()
+    )
+    if tf.executing_eagerly():
+        tf.print("---------gen_acc-----------")
+        tf.print("face_present: ", face_present.numpy())
+        tf.print("true_labels: ", true_labels.numpy())
+        tf.print("pred_labels: ", pred_labels.numpy())
+        tf.print("correct: ", correct.numpy())
+        tf.print("accuracy: ", accuracy.numpy())
+        tf.print("--------------------")
+    return accuracy

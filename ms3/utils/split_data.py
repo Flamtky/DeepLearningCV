@@ -65,7 +65,7 @@ def split_csv(csv_file, train_files, val_files, test_files, base_dir):
 
 
 def main():
-    base_dir = "."  # Set this to your base directory if different
+    base_dir = "."
     faces_dir = os.path.join(base_dir, "faces")
     no_faces_dir = os.path.join(base_dir, "no_faces")
     csv_file = os.path.join(base_dir, "faces_anno.csv")
@@ -105,6 +105,20 @@ def main():
     # Split CSV file for faces
     split_csv(csv_file, faces_train, faces_val, faces_test, base_dir)
 
+def split_data(src_dir, target_dir, split_ratio=0.2):
+    data_files = os.listdir(src_dir)
+    split_count = int(len(data_files) * split_ratio)
+    random.seed(42)
+    random.shuffle(data_files)
+    files_to_move = data_files[:split_count]
+
+    os.makedirs(target_dir, exist_ok=True)
+    process_files(files_to_move, src_dir, target_dir)
 
 if __name__ == "__main__":
-    main()
+    #main()
+    #split_data("../train/lhq_256", "../train/1lhq_256", split_ratio=0.9)
+    split_data("../stylegan3/out/00", "../val/gen/00", split_ratio=0.1)
+    split_data("../stylegan3/out/10", "../val/gen/10", split_ratio=0.1)
+    split_data("../stylegan3/out/01", "../val/gen/01", split_ratio=0.1)
+    split_data("../stylegan3/out/11", "../val/gen/11", split_ratio=0.1)

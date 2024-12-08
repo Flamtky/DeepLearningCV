@@ -2,7 +2,9 @@ import os, sys
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import keras
 import cv2
+import numpy as np
 
 AGE_GROUPS = [
     "INFANT",  # 0-4
@@ -16,67 +18,291 @@ AGE_GROUPS = [
 
 age_group_to_index = {group: idx for idx, group in enumerate(AGE_GROUPS)}
 gender_to_index = {"M": 0, "F": 1}
+STYLEGEN_GEN_IMG_AGE_MAPPING = {
+    0:"CHILD",
+    1:"ADULT",
+    2:"YOUNG_ADULT",
+    3:"SENIOR",
+    4:"INFANT",
+    5:"TEENAGER",
+    6:"MIDDLE_AGED",
+}
 
-def load_data(data_dir, split, batch_size=32, image_size=(224, 224)):
+IGNORE_STYLEGEN_IMGS = True
+
+def load_data_new(data_dir, split, batch_size=32, image_size=(224, 224)):
     """
-    Load face image data for a specific split ('train', 'val', 'test').
-    Expected structure:
+    Load data for a specific split ('train', 'val', 'test').
+    Also it loads stylegan generated face images and maps them to the age groups and gender
+
+    Expected folder structure:
     data_dir/
         train/
-            images/
-                image.jpg
+            faces/
+                image.png (always .png)
                 ...
-            anno_train.csv
-        val/
-            images/
+            gen/
+                00/ # 00 -> 0: STYLEGEN_GEN_IMG_AGE_MAPPING -> CHILD; 0: gender_to_index -> M
+                    image.png (always .png)
+                01/ # 0: CHILD; 1: F
+                    image.png (always .png)
+                11/ # 1: ADULT; 1: F
+                    image.png (always .png)
+                20/ # 2: YOUNG_ADULT; 0: M
+                    image.png (always .png)
                 ...
-            anno_val.csv
+            no_faces/
+                ...
+            faces_anno_train.csv
+
+    The CSV files (faces_anno_{split}.csv) should have the following columns:
+    - image_path: Path to the image file relative to the 'faces' directory (e.g., 'faces/image1.jpg')
+    - age_group: Age group label
+    - gender: Gender label
+
+    'no_faces' directory contains images with no faces and no CSV annotations.
     """
+
     # Path to the CSV file
     csv_path = os.path.join(data_dir, split, f"faces_anno_{split}.csv")
-    
-    # Load data
-    df = pd.read_csv(csv_path, delimiter=";")
-    df["image_path"] = df["image_path"].apply(
-        lambda x: os.path.join(data_dir, split, x)
-    )
-    df["age_group"] = df["age_group"].map(age_group_to_index)
-    df["gender"] = df["gender"].map(gender_to_index)
+
+    # Load face data
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path, delimiter=";")
+        # Adjust the image paths to be absolute
+        df["image_path"] = df["image_path"].apply(
+            lambda x: os.path.join(data_dir, split, x.replace(".jpg", ".png"))
+        )
+        def parse_age_group(age_group):
+            age_gr = age_group_to_index[age_group]
+            return 1 if age_gr <= 2 else 0 # only isYoung check => 1: isYoung; 0: isOld
+        df["age_group"] = df["age_group"].map(parse_age_group)
+        df["gender"] = df["gender"].map(gender_to_index)
+        df["face"] = 1  # Face present
+    else:
+        raise ValueError(f"CSV file not found: {csv_path}")
+
+    if not IGNORE_STYLEGEN_IMGS:
+        # Load stylegen generated face images
+        gen_dir = os.path.join(data_dir, split, "gen")
+        if os.path.exists(gen_dir):
+            gen_dirs = [
+                os.path.join(gen_dir, f)
+                for f in os.listdir(gen_dir)
+                if os.path.isdir(os.path.join(gen_dir, f)) and
+                f in ["00", "01", "10", "11"]
+            ]
+            gen_df = pd.DataFrame(columns=["image_path", "age_group", "gender", "face"])
+            for gen_file in gen_dirs:
+                age_gr = int(list(gen_file.split("/")[-1])[0])
+                age_group = 1 if age_gr <= 2 else 0 # only isYoung check
+                gender = int(list(gen_file.split("/")[-1])[1])
+                files = [
+                    os.path.join(gen_file, f)
+                    for f in os.listdir(gen_file)
+                    if os.path.isfile(os.path.join(gen_file, f))
+                ]
+                gen_df = pd.concat([gen_df, pd.DataFrame({"image_path": files, "age_group": age_group, "gender": gender, "face": 1})], ignore_index=True)
+        else:
+            raise ValueError(f"Stylegen generated images not found: {gen_dir}")
+
+        # Combine face and stylegen data
+        all_data = pd.concat([df, gen_df], ignore_index=True)
+    else:
+        all_data = df
+
+    # Load non-face data
+    no_face_dirs = ["no_faces"] 
+    if not IGNORE_STYLEGEN_IMGS:
+        no_face_dirs.append("no_faces_gen") # no_faces_gen: stylegen failed face imgs
+
+    for no_face_dir in no_face_dirs:
+        non_face_dir = os.path.join(data_dir, split, no_face_dir)
+        if os.path.exists(non_face_dir):
+            files = [
+                os.path.join(non_face_dir, f)
+                for f in os.listdir(non_face_dir)
+                if os.path.isfile(os.path.join(non_face_dir, f))
+            ]
+            non_face_df = pd.DataFrame({"image_path": files})
+            non_face_df["age_group"] = 2 # Placeholder
+            non_face_df["gender"] = 2  # Placeholder
+            non_face_df["face"] = 0
+            # Combine face and non-face data
+            all_data = pd.concat([all_data, non_face_df], ignore_index=True)
 
     # Shuffle the data
-    df = df.sample(frac=1).reset_index(drop=True)
+    all_data = all_data.sample(frac=1).reset_index(drop=True)
 
-    # Crop dataframe after X entries
-    #CROP = 640
-    #df = df.head(CROP)
-
-    # Create TensorFlow dataset
-    image_paths = df["image_path"].values
-    age_labels = df["age_group"].values.astype(np.int32)
-    gender_labels = df["gender"].values.astype(np.int32)
+    # Create TensorFlow dataset from DataFrame
+    image_paths = all_data["image_path"].values
+    face_labels = all_data["face"].values.astype(np.float32)
+    age_labels = all_data["age_group"].values.astype(np.int32)
+    gender_labels = all_data["gender"].values.astype(np.int32)
 
     dataset = tf.data.Dataset.from_tensor_slices(
-        (image_paths, age_labels, gender_labels)
+        (image_paths, face_labels, age_labels, gender_labels)
     )
 
-    def parse_function(image_path, age_label, gender_label):
+    # Define parsing function
+    def parse_function(image_path, face_label, age_label, gender_label):
         # Load and preprocess image
         image = tf.io.read_file(image_path)
         image = tf.image.decode_image(image, channels=3)
         image.set_shape([None, None, 3])
         image = tf.image.resize(image, image_size)
-        image = image / 255.0 * 2.0 - 1.0  # Normalize to [-1, 1]
+        image = image / 255.0  # Normalize to [0, 1]
 
-        # Data augmentation
         image = tf.image.random_flip_left_right(image)
-        image = tf.image.random_brightness(image, 0.2)
-        image = tf.clip_by_value(image, -1.0, 1.0)
+        image = tf.image.random_flip_up_down(image)
+        image = tf.image.rot90(image, tf.random.uniform(shape=[], minval=0, maxval=4, dtype=tf.int32))
 
-        # Prepare one-hot labels
-        age_one_hot = tf.one_hot(age_label, depth=len(AGE_GROUPS))
-        gender_one_hot = tf.one_hot(gender_label, depth=2)
+        # Prepare labels
+        age_one_hot = tf.one_hot(age_label, depth=2 + 1)
+        gender_label = tf.one_hot(gender_label, depth=2 + 1)
 
-        return image, {"age": age_one_hot, "gender": gender_one_hot}
+        # Prepare outputs
+        age_output = age_one_hot
+        gender_output = gender_label
+
+        # Sample weights
+        sample_weight_face = 1.0
+        sample_weight_age = face_label
+        sample_weight_gender = face_label
+
+        return (
+            image,
+            {"face": face_label, "age": age_output, "gender": gender_output},
+            {
+                "face": sample_weight_face,
+                "age": sample_weight_age,
+                "gender": sample_weight_gender,
+            },
+        )
+
+    # Apply parsing function and batch the dataset
+    dataset = dataset.map(parse_function, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.shuffle(buffer_size=5_000, seed=1337)
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+    return dataset
+
+def load_data(data_dir, split, batch_size=32, image_size=(224, 224)):
+    """
+    Load data for a specific split ('train', 'val', 'test').
+
+    Expected folder structure:
+    data_dir/
+        train/
+            faces/
+                image.jpg
+                ...
+            no_faces/
+                ...
+            faces_anno_train.csv
+        val/
+            faces/
+                ...
+            no_faces/
+                ...
+            faces_anno_val.csv
+        test/
+            faces/
+                ...
+            no_faces/
+                ...
+            faces_anno_test.csv
+
+    The CSV files (faces_anno_{split}.csv) should have the following columns:
+    - image_path: Path to the image file relative to the 'faces' directory (e.g., 'faces/image1.jpg')
+    - age_group: Age group label
+    - gender: Gender label
+
+    'no_faces' directory contains images with no faces and no CSV annotations.
+    """
+
+    # Path to the CSV file
+    csv_path = os.path.join(data_dir, split, f"faces_anno_{split}.csv")
+
+    # Load face data
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path, delimiter=";")
+        # Adjust the image paths to be absolute
+        df["image_path"] = df["image_path"].apply(
+            lambda x: os.path.join(data_dir, split, x)
+        )
+        df["age_group"] = df["age_group"].map(age_group_to_index)
+        df["gender"] = df["gender"].map(gender_to_index)
+        df["face"] = 1  # Face present
+    else:
+        df = pd.DataFrame(columns=["image_path", "age_group", "gender", "face"])
+
+    # Load non-face data
+    non_face_dir = os.path.join(data_dir, split, "no_faces")
+    if os.path.exists(non_face_dir):
+        files = [
+            os.path.join(non_face_dir, f)
+            for f in os.listdir(non_face_dir)
+            if os.path.isfile(os.path.join(non_face_dir, f))
+        ]
+        non_face_df = pd.DataFrame({"image_path": files})
+        non_face_df["age_group"] = 7  # Placeholder
+        non_face_df["gender"] = 2  # Placeholder
+        non_face_df["face"] = 0
+        # Combine face and non-face data
+        all_data = pd.concat([df, non_face_df], ignore_index=True)
+    else:
+        all_data = df
+
+    # Shuffle the data
+    all_data = all_data.sample(frac=1).reset_index(drop=True)
+
+    # Create TensorFlow dataset from DataFrame
+    image_paths = all_data["image_path"].values
+    face_labels = all_data["face"].values.astype(np.float32)
+    age_labels = all_data["age_group"].values.astype(np.int32)
+    gender_labels = all_data["gender"].values.astype(np.int32)
+
+    dataset = tf.data.Dataset.from_tensor_slices(
+        (image_paths, face_labels, age_labels, gender_labels)
+    )
+
+    # Define parsing function
+    def parse_function(image_path, face_label, age_label, gender_label):
+        # Load and preprocess image
+        image = tf.io.read_file(image_path)
+        image = tf.image.decode_image(image, channels=3)
+        image.set_shape([None, None, 3])
+        image = tf.image.resize(image, image_size)
+        image = image / 255.0  # Normalize to [0, 1]
+
+        image = tf.image.random_flip_left_right(image)
+        image = tf.image.random_flip_up_down(image)
+        image = tf.image.rot90(image, tf.random.uniform(shape=[], minval=0, maxval=4, dtype=tf.int32))
+
+        # Prepare labels
+        age_one_hot = tf.one_hot(age_label, depth=len(AGE_GROUPS) + 1)
+        gender_label = tf.one_hot(gender_label, depth=2 + 1)
+
+        # Prepare outputs
+        age_output = age_one_hot
+        gender_output = gender_label
+
+        # Sample weights
+        sample_weight_face = 1.0
+        sample_weight_age = face_label
+        sample_weight_gender = face_label
+
+        return (
+            image,
+            {"face": face_label, "age": age_output, "gender": gender_output},
+            {
+                "face": sample_weight_face,
+                "age": sample_weight_age,
+                "gender": sample_weight_gender,
+            },
+        )
 
     # Apply parsing function and batch the dataset
     dataset = dataset.map(parse_function, num_parallel_calls=tf.data.AUTOTUNE)
@@ -91,16 +317,18 @@ def display_batch_with_labels(data_dir, batch_size=16, image_size=(224, 224)):
         data_dir, "val", batch_size=batch_size, image_size=image_size
     )
     print(val_dataset.take(1))
-    for images, labels in val_dataset.take(1):
+    for images, labels, _ in val_dataset.take(1):  # Add '_' to unpack sample weights
         images = images.numpy()
         age_labels = labels["age"].numpy()
         gender_labels = labels["gender"].numpy()
         for i in range(len(images)):
             image = images[i]
             # Denormalize image if necessary
-            image = ((image + 1.0) * 127.5).astype(np.uint8)
-            age_label = np.argmax(age_labels[i])
-            gender_label = np.argmax(gender_labels[i])
+            image = (image * 255).astype(np.uint8)
+            age_label = np.argmax(age_labels[i])  # Exclude face_present flag if present
+            gender_label = np.argmax(
+                gender_labels[i]
+            )  # Exclude face_present flag if present
             age_text = (
                 AGE_GROUPS[age_label] if age_label < len(AGE_GROUPS) else "Unknown"
             )
@@ -138,6 +366,7 @@ def display_batch_with_labels(data_dir, batch_size=16, image_size=(224, 224)):
             cv2.imshow("Image", image_bgr)
             cv2.waitKey(0)
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TensorFlow warnings
