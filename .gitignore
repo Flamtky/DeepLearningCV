@@ -18,3 +18,5 @@ output_csvs/
 *.log
 *.png
 *.jpg
+
+*.pkl

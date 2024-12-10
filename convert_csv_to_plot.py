@@ -2,7 +2,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-NAMES = ['epoch_loss.csv']
+NAMES = ['epoch_age_age_acc.csv', 'epoch_gender_gen_acc.csv']
 
 for name in NAMES:
     print(f'Showing {name}')

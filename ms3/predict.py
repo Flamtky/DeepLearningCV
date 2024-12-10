@@ -7,16 +7,24 @@ from model import (
     AGE_GROUPS,
 )
 
-MODEL_PATH = (
-    "./models/0_efficientnetb0_relu_ds256_dl2_nobn_do0.0_wd0.0_lr1e-05_decay0.9.keras"
-)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+MODEL_PATH = (
+    "./cur_best_model.keras"
+)
 
 def load_model_from_file():
     return keras.models.load_model(
         MODEL_PATH,
     )
 
+def seed_to_filename(seed, label_folder_name):
+    try:
+        age, gen = map(int, list(label_folder_name))
+    except ValueError:
+        raise ValueError(f"Invalid label folder name (got {label_folder_name})")
+
+    return f"seed{seed:04d}_tensor([[{age}., {gen}.]], device='cuda:0').png"
 
 def preprocess_image(image_path, target_size=(224, 224)):
     """
@@ -46,34 +54,34 @@ def predict_image(image_path, ground_truth):
     """
     Predicts face presence, age group, and gender for a given image.
     """
-    # Load the model
     model = load_model_from_file()
 
-    # Preprocess the image
+    # Preprocess
     img = preprocess_image(image_path)
 
-    # Get predictions
     predictions = model.predict(img)
-
-    # Extract predictions
     pred_face, pred_age, pred_gender = predictions.values()
 
-    # Process predictions
     age_index = np.argmax(pred_age[0])
     gender_index = np.argmax(pred_gender[0])
 
     age_text = AGE_GROUPS[age_index]
     gender_text = "Male" if gender_index == 0 else "Female"
 
-    # Retrieve ground truth
+    # Ground truth
     image_name = os.path.basename(image_path)
-    gt_info = ground_truth.get(
-        f"faces/{image_name}", {"age_group": "Unknown", "gender": "Unknown"}
-    )
+    if ground_truth is None:
+        gt_info = {"age_group": "Unknown", "gender": "Unknown"}
+    else:
+        gt_info = ground_truth.get(
+            f"faces/{image_name}", {"age_group": "Unknown", "gender": "Unknown"}
+        )
     gt_age = gt_info["age_group"]
     gt_gender = gt_info["gender"]
 
-    # Print formatted results
+    if pred_face[0][0] > 0.5:
+        return
+
     print(f"Image: {image_name}")
     print("Prediction Results:")
     print(f"  Face present probability: {pred_face[0][0]:.2f}")
@@ -84,7 +92,7 @@ def predict_image(image_path, ground_truth):
     print(f"  Age Group: {gt_age}")
     print(f"  Gender: {gt_gender}")
 
-    # Load original image using OpenCV
+    # Load original image
     image = cv2.imread(image_path)
     if image is None:
         print(f"Error: Unable to read image '{image_path}'")
@@ -98,13 +106,21 @@ def predict_image(image_path, ground_truth):
     cv2.putText(image, f"Gender: {gender_text}", (10, 70), font, 1, (0, 0, 255), 2)
 
     # Display the image
-    cv2.imshow("Prediction", image)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    cv2.imwrite("prediction.jpg", image)
+    input("Press Enter to continue...")
 
+
+SUBFOLDER = "10"
+
+def predict_seed(seed, label_folder_name):
+    IMAGE_PATH = os.path.join(f"./train/gen/{SUBFOLDER}", seed_to_filename(seed, label_folder_name))
+    predict_image(IMAGE_PATH, None)
 
 if __name__ == "__main__":
-    IMAGES = "./test/faces"
+
+    # predict_seed(736, SUBFOLDER)
+
+    IMAGES = "./val/gen/01"
     ground_truth = load_ground_truth()
 
     for image_name in os.listdir(IMAGES):

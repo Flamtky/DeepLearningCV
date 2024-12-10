@@ -6,7 +6,7 @@ from tensorflow.core.util import event_pb2
 
 def tensorboard_logs_to_csv(log_dir, regex_pattern, output_dir):
     pattern = re.compile(regex_pattern)
-    tags_to_extract = ['epoch_age_loss', 'epoch_face_loss', 'epoch_gender_loss', 'epoch_loss']
+    tags_to_extract = ['epoch_age_age_acc', 'epoch_face_accuracy', 'epoch_gender_gen_acc']
     data = {tag: [] for tag in tags_to_extract}
 
     for root, dirs, files in os.walk(log_dir):
@@ -54,4 +54,4 @@ def tensorboard_logs_to_csv(log_dir, regex_pattern, output_dir):
         print(f"Written {len(records)} records to {output_csv}")
 
 if __name__ == "__main__":
-    tensorboard_logs_to_csv('logs/', r'test[910].*validation$', 'output_csvs')
+    tensorboard_logs_to_csv('logs/', r'ms3_final.*validation$', 'output_csvs')
