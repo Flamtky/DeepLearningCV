@@ -20,3 +20,5 @@ output_csvs/
 *.jpg
 
 *.pkl
+
+*.keras
