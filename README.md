@@ -7,7 +7,7 @@
 - `parameters.py`: Contains the hyperparameters static and dynamic.
 - `data_loader.py`: Contains the data loader.
 - `test.py`: Evaluates the model.
-- `predict.py`: Predicts single images using the model.
+- `predict.py`: Predicts single images using the model.  
 MS3 Files:
     * `wgan_*.py`: Wasserstein cGAN (not working)
     * `cgan_*.py`: cGan
